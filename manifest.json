@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Kyara Plus",
+  "version": "2.6.2",
+  "description": "Améliorations d’interface et outils de collection pour kyara.games.",
+  "permissions": [
+    "alarms",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://kyara.games/*",
+        "https://www.kyara.games/*"
+      ],
+      "js": [
+        "bridge.js"
+      ],
+      "run_at": "document_start",
+      "css": [
+        "panel.css"
+      ]
+    },
+    {
+      "matches": [
+        "https://kyara.games/*",
+        "https://www.kyara.games/*"
+      ],
+      "js": [
+        "booster-core.js",
+        "kyara-plus.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ]
+}
