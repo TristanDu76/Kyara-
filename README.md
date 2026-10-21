@@ -2,7 +2,7 @@
 
 Cette extension charge le script Kyara Plus fourni sur `kyara.games`. Elle utilise uniquement les permissions Chrome `alarms` et `storage` pour réveiller l’onglet Kyara à l’heure prévue et mémoriser ce réveil localement.
 
-La version 2.6.2 apporte un tableau de bord dans la DA de Kyara et un moteur d’ouverture testé. Le bouton **KYARA +** ouvre quatre onglets : Boosters, Historique, Interface et Outils.
+La version 2.7.0 prépare Firefox Android avec les mêmes sources que Chrome et améliore les contrôles tactiles sur petit écran. Le bouton **KYARA +** ouvre quatre onglets : Boosters, Historique, Interface et Outils.
 
 ## Utiliser l’automatisation
 
@@ -42,9 +42,34 @@ GitHub conserve le code. Les réglages et l’historique restent propres à chaq
 
 Pour une mise à jour : **Recharger** l’extension dans cette page, puis recharger Kyara. Une navigation interne de Kyara conserve le code déjà injecté ; elle ne suffit pas à appliquer une nouvelle version.
 
-### Firefox
+### Firefox Android — paquet à signer
 
-Le manifeste MV3 utilise `world: "MAIN"` dans un content script déclaré, fonctionnalité prise en charge différemment selon le navigateur et sa version. Si Firefox refuse de charger l’extension ou ne démarre pas le script dans le contexte de page, cette version doit être portée vers un script MAIN injecté par `scripting.executeScript` depuis un background script, avec les permissions d’hôte correspondantes.
+Firefox Android **142 ou plus récent** est requis. Le ZIP du dépôt et le ZIP généré ne s’installent pas directement : une installation normale exige un **XPI signé par Mozilla**. Chrome Android ne charge pas cette extension.
+
+1. Générer les paquets avec `python scripts/build.py` (Python 3.10+ ; sous Windows, `py -3 scripts/build.py` convient aussi).
+2. Avec un compte Mozilla, ouvrir le [portail développeur AMO](https://addons.mozilla.org/developers/addon/submit/distribution), choisir la distribution **On your own / par vos propres moyens**, puis soumettre `dist/kyara-plus-firefox-<version>-unsigned.zip` en remplaçant `<version>` par la valeur `version` de `manifest.json`. Cela transmet le code à Mozilla pour signature, sans fiche publique dans leur catalogue. Aucun identifiant Mozilla n’est stocké dans le dépôt.
+3. Après validation, télécharger le **XPI signé** et le transférer sur le téléphone.
+4. Dans Firefox Android : **Paramètres → À propos de Firefox → toucher le logo cinq fois rapidement**.
+5. Revenir dans **Paramètres → Installer une extension depuis un fichier**, sélectionner le XPI et accepter l’installation et l’accès à Kyara.
+6. Ouvrir `https://kyara.games`, se connecter et ouvrir **KYARA +**.
+
+Ne pas renommer le ZIP en XPI : cela ne remplace pas la signature. Pour une mise à jour privée, signer un nouveau paquet avec le même identifiant d’extension et une version supérieure, puis installer le nouveau XPI. Les mises à jour privées ne sont pas automatiques dans cette configuration.
+
+Références : [installation Android depuis un fichier](https://extensionworkshop.com/documentation/publish/install-self-distributed/), [distribution privée et signature](https://extensionworkshop.com/documentation/publish/self-distribution/).
+
+Sur mobile, garder Firefox et l’onglet Kyara ouverts au premier plan pendant une session automatique. Android peut suspendre le navigateur en arrière-plan ou écran verrouillé. Au retour dans l’onglet, le script relit le stock et reprend si l’automatisation est toujours activée. Il n’ouvre aucun booster sans confirmation explicite de sa gratuité. Les réglages et l’historique du PC ne sont pas transférés sur le téléphone.
+
+Pour tester sur Firefox **de bureau 140+**, générer le paquet puis charger `dist/firefox/manifest.json` dans **about:debugging → Ce Firefox → Charger un module complémentaire temporaire**. Ce chargement disparaît au redémarrage du navigateur et ne remplace pas un test sur Android.
+
+## Maintenance Chrome et Android
+
+Une seule base de code et une seule version sont conservées. `manifest.json` reste le manifeste Chrome ; `platforms/firefox.json` décrit seulement les différences Firefox (script d’arrière-plan et paramètres Mozilla). `python scripts/build.py` génère `dist/chrome/`, `dist/firefox/` et leurs ZIP, sans dépendance Python supplémentaire.
+
+Les fichiers générés restent hors Git. Les archives contiennent uniquement les cinq assets du runtime et le manifeste, sans tests, documentation, captures, fichiers locaux ou credentials.
+
+La branche `feat/firefox-android` sert à préparer et valider cette adaptation. La cible est de la fusionner dans `main` après validation mobile, puis de conserver **Chrome et Firefox ensemble dans `main`**. Les prochaines corrections communes seront ainsi présentes dans les deux paquets ; deux branches permanentes imposeraient des reports manuels inutiles.
+
+Pour une livraison : augmenter `version` dans `manifest.json` et `VERSION` dans `kyara-plus.js`, lancer les validations, générer les deux paquets, tester les deux navigateurs, puis faire signer le paquet Firefox. Conserver `browser_specific_settings.gecko.id` pour que Firefox reconnaisse les mises à jour.
 
 ## Actions du script
 
@@ -59,11 +84,25 @@ La plupart des fonctions ajoutent des éléments d’interface ou lisent les don
 - `bridge.js` : messages entre le contexte du site et l’extension.
 - `panel.css` : interface du compagnon.
 - `test/` : tests de régression, du pont et de l’ordonnanceur.
+- `platforms/firefox.json` : différences du manifeste Firefox, y compris Android.
+- `scripts/build.py` : génération des deux paquets depuis les mêmes sources.
 
 Le code s’exécute dans le contexte de page pour observer les appels `fetch` du site. Il ne dispose d’aucune permission d’accès aux cookies ou aux autres sites.
 
 ## Vérification locale
 
 Sans dépendance supplémentaire : `node --test test/*.test.js`. Contrôle de syntaxe : `node --check kyara-plus.js`, puis les mêmes contrôles sur `booster-core.js`, `bridge.js` et `service-worker.js`.
+
+Tests de génération : `python -m unittest discover -s test -p "*_test.py"`. Ils vérifient les manifestes, l’identité des scripts entre navigateurs, le contenu et l’intégrité des ZIP, la reproductibilité et la conservation des fichiers étrangers au build.
+
+Validation manuelle Android avant diffusion : chargement du panneau, défilement sans débordement à 320–420 px, choix du type, ouverture gratuite ×1, bilan, pause, refus du bouton payant et reprise au retour au premier plan. Une vérification de bureau ou une simulation de largeur mobile ne garantit pas le comportement d’Android en arrière-plan.
+
+### État de validation de la 2.7.0
+
+- 23 tests Node et deux tests Python réussis ; syntaxe des quatre scripts vérifiée.
+- Paquet Firefox contrôlé avec le validateur Mozilla `web-ext lint`.
+- Firefox de bureau 158.0.1, profil isolé, extension temporaire et site local simulé : choix de Shōnen, réveil via les API réelles de Firefox, deux ouvertures gratuites ×1, stock 2 → 0, dix cartes dans l’historique, aucune dépense et mise en pause.
+- Les quatre vues du panneau ont été contrôlées à 320, 390 et 420 pixels sans débordement horizontal ; bouton de fermeture accessible. Pour ce banc uniquement, les motifs d’URL et la vérification d’origine du background ont été adaptés à localhost dans une copie temporaire ; les paquets livrés restent limités à Kyara.
+- **À faire : signature Mozilla, installation et validation sur un véritable téléphone Android.** Aucun fonctionnement en arrière-plan sur Android n’est certifié par ces contrôles.
 
 Les contrôles DOM dépendent de l’interface actuelle de Kyara. Si elle change, une absence de bouton ou de compteur arrête le passage ; elle n’autorise pas un achat en chakra.

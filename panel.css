@@ -94,7 +94,8 @@
 #kp-panel .kp-empty b { display: block; color: #e6dce8; font-size: 18px; margin-bottom: 10px; }
 #kp-panel .kp-footer { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 13px 30px; border-top: 1px solid var(--kp-line); color: #84778d; font: 10px ui-monospace, monospace; }
 @media(max-width:760px) {
-  #kp-panel { width: calc(100vw - 20px); height: calc(100dvh - 20px); border-radius: 18px; }
+  #kp-gear { right: max(12px, env(safe-area-inset-right)); bottom: max(12px, env(safe-area-inset-bottom)); }
+  #kp-panel { width: calc(100vw - 20px); height: calc(100dvh - 20px); border-radius: 18px; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
   #kp-panel .kp-header { padding: 18px; }
   #kp-panel .kp-shell { grid-template-columns: minmax(0,1fr); grid-template-rows: auto minmax(0,1fr); }
   #kp-panel .kp-sidebar { flex-direction: row; padding: 8px; border-right: 0; border-bottom: 1px solid var(--kp-line); gap: 2px; }
@@ -107,5 +108,21 @@
   #kp-panel .kp-metric b { font-size: 22px; }
   #kp-panel .kp-footer { padding: 12px 18px; }
   #kp-panel .kp-rarity-grid { grid-template-columns: repeat(3,minmax(0,1fr)); }
+  #kp-panel .kp-close { width: 44px; height: 44px; flex: none; }
+  #kp-panel .kp-nav, #kp-panel .kp-pack, #kp-panel button.kp-b { min-height: 44px; }
+  #kp-panel input[type="number"], #kp-panel select { font-size: 16px; }
+  #kp-panel .kp-content { overscroll-behavior: contain; min-width: 0; }
+  #kp-panel .kp-loot { grid-template-columns: repeat(3,minmax(0,1fr)); }
+}
+@media(max-width:420px) {
+  #kp-panel .kp-sidebar { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+  #kp-panel .kp-pack-grid, #kp-panel .kp-loot { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  #kp-panel .kp-overview { grid-template-columns: minmax(0,1fr); }
+  #kp-panel .kp-metric { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  #kp-panel .kp-metric small { margin: 0; }
+  #kp-panel .kp-brand-sub { display: none; }
+  #kp-panel h2 { font-size: 26px; }
+  #kp-panel .kp-footer, #kp-panel .kp-history-head { flex-wrap: wrap; }
+  #kp-panel .kp-btns button { width: 100%; }
 }
 @media(prefers-reduced-motion:reduce) { #kp-panel *, #kp-gear { transition: none !important; transform: none !important; } }

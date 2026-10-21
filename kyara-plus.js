@@ -5,7 +5,7 @@
    * 1. CONFIG — tout ce qui dépend du site est ici
    * ======================================================================== */
 
-  const VERSION = '2.6.2';
+  const VERSION = '2.7.0';
   const BoosterCore = globalThis.KyaraPlusBoosterCore;
   if (!BoosterCore) throw new Error('Kyara+ : booster-core.js doit être chargé avant kyara-plus.js.');
   const IN_FRAME = window.top !== window;
@@ -2474,7 +2474,7 @@
         el('div', { class: 'kp-pack-grid', role: 'group', 'aria-label': 'Type de booster' }, packButtons),
         field('Boosters max par passage', cfg.max, 1, 10, (v) => updateSettings((d) => { d.booster.max = v; })),
         field('Pause entre deux ouvertures (s)', cfg.spacingSec, 1, 30, (v) => updateSettings((d) => { d.booster.spacingSec = v; })),
-        el('p', { class: 'kp-note', text: 'Gratuits uniquement · ×1 par ouverture · garde cet onglet Kyara ouvert et Chrome lancé. Le mode veille du PC suspend les ouvertures.' })),
+        el('p', { class: 'kp-note', text: 'Gratuits uniquement · ×1 par ouverture · garde cet onglet Kyara et le navigateur ouverts. Sur mobile, reste au premier plan : Android ou le mode veille peuvent suspendre les ouvertures.' })),
       panelCard('Ton dernier tirage', dyn.latest = el('div')),
     ];
   }

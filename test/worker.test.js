@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-function fixture() {
+function fixture(namespace = 'chrome') {
   const listeners = {}, storage = {}, alarms = new Map(), sent = [];
   let now = 1000;
   const chrome = {
@@ -22,7 +22,9 @@ function fixture() {
     } },
     tabs: { async sendMessage(id, message) { sent.push({ id, message }); }, onRemoved: { addListener(fn) { listeners.removed = fn; } } },
   };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8'), { chrome, Date: { now: () => now }, URL });
+  const context = { [namespace]: chrome, Date: { now: () => now }, URL };
+  if (namespace === 'browser') context.chrome = new Proxy({}, { get() { throw new Error('API chrome utilisée sur Firefox'); } });
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8'), context);
   const message = (id, type, when, url = 'https://kyara.games/ouvrir/shonen') => listeners.message({ channel: 'kyara-plus:booster-alarm', type, when }, { tab: { id }, url });
   return { chrome, listeners, storage, alarms, sent, message, setNow: (value) => { now = value; } };
 }
@@ -32,6 +34,18 @@ test('deux onglets gardent leurs propres réveils et annulations', async () => {
   assert.equal(f.alarms.size, 2);
   await f.message(42, 'cancel');
   assert.equal(f.alarms.size, 1); assert.equal([...f.alarms.values()][0], 6000);
+});
+
+test('Firefox programme, réveille et annule avec les API browser', async () => {
+  const f = fixture('browser');
+  await f.message(7, 'schedule', 1500);
+  await f.message(42, 'schedule', 5000);
+  f.setNow(1500);
+  await f.listeners.alarm({ name: 'kyara-plus:booster-wake:7' });
+  assert.equal(f.sent[0].id, 7);
+  await f.message(7, 'cancel');
+  assert.equal(f.alarms.size, 1);
+  assert.equal(f.alarms.get('kyara-plus:booster-wake:42'), 5000);
 });
 test('un réveil échu cible uniquement son onglet et jamais avant son échéance', async () => {
   const f = fixture(); await f.message(7, 'schedule', 1);

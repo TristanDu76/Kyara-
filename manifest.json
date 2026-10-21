@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Kyara Plus",
-  "version": "2.6.2",
+  "version": "2.7.0",
   "description": "Améliorations d’interface et outils de collection pour kyara.games.",
   "permissions": [
     "alarms",

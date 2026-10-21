@@ -1,5 +1,6 @@
 'use strict';
 
+const extension = typeof browser !== 'undefined' ? browser : chrome;
 const CHANNEL = 'kyara-plus:booster-alarm';
 const PREFIX = 'kyara-plus:booster-wake:';
 const queues = new Map();
@@ -12,11 +13,11 @@ function enqueue(tabId, task) {
 }
 async function cancel(tabId) {
   const name = PREFIX + tabId;
-  await chrome.alarms.clear(name);
-  await chrome.storage.session.remove(name);
+  await extension.alarms.clear(name);
+  await extension.storage.session.remove(name);
 }
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+extension.runtime.onMessage.addListener((message, sender) => {
   if (message?.channel !== CHANNEL || !Number.isInteger(sender.tab?.id)) return;
   try {
     const url = new URL(sender.url || '');
@@ -28,24 +29,24 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   return enqueue(tabId, async () => {
     const when = Math.max(Date.now() + 500, message.when);
     const name = PREFIX + tabId;
-    await chrome.storage.session.set({ [name]: { tabId, when } });
-    await chrome.alarms.create(name, { when });
+    await extension.storage.session.set({ [name]: { tabId, when } });
+    await extension.alarms.create(name, { when });
     return { ok: true };
   });
 });
-chrome.alarms.onAlarm.addListener((alarm) => {
+extension.alarms.onAlarm.addListener((alarm) => {
   if (!alarm.name.startsWith(PREFIX)) return;
   const tabId = Number(alarm.name.slice(PREFIX.length));
   if (!Number.isInteger(tabId)) return;
   return enqueue(tabId, async () => {
-    const stored = await chrome.storage.session.get(alarm.name);
+    const stored = await extension.storage.session.get(alarm.name);
     const target = stored[alarm.name];
     if (!target || target.when > Date.now()) return;
     try {
-      await chrome.tabs.sendMessage(target.tabId, { channel: CHANNEL, type: 'wake' });
+      await extension.tabs.sendMessage(target.tabId, { channel: CHANNEL, type: 'wake' });
     } catch {
       await cancel(target.tabId);
     }
   });
 });
-chrome.tabs.onRemoved.addListener((tabId) => enqueue(tabId, () => cancel(tabId)).catch(() => {}));
+extension.tabs.onRemoved.addListener((tabId) => enqueue(tabId, () => cancel(tabId)).catch(() => {}));
