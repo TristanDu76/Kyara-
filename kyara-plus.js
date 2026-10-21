@@ -5,7 +5,7 @@
    * 1. CONFIG — tout ce qui dépend du site est ici
    * ======================================================================== */
 
-  const VERSION = '2.7.0';
+  const VERSION = '2.8.2';
   const BoosterCore = globalThis.KyaraPlusBoosterCore;
   if (!BoosterCore) throw new Error('Kyara+ : booster-core.js doit être chargé avant kyara-plus.js.');
   const IN_FRAME = window.top !== window;
@@ -253,7 +253,7 @@
     features: {}, // nom de feature → false pour la désactiver
     options: { valueDelta: true, confirmGive: true, newOffers: true, autoRefreshOffers: false, notify: false },
     refreshMinutes: 5,
-    booster: { enabled: false, max: 10, spacingSec: 4 },
+    booster: { enabled: false, batchSize: 10, spacingSec: 4 },
   });
 
   /** Normalise des réglages quelconques (stockage corrompu, ancienne version) vers un objet valide. */
@@ -271,7 +271,7 @@
       booster: {
         enabled: b.enabled === true,
         type: BoosterCore.TYPES.includes(b.type) ? b.type : 'all',
-        max: clamp(Math.round(num(b.max, 10)), 1, 10),
+        batchSize: clamp(Math.round(num(b.batchSize ?? b.max, 10)), 1, 10),
         spacingSec: clamp(Math.round(num(b.spacingSec, 4)), 1, 30),
       },
     };
@@ -479,10 +479,12 @@
    * 6. RÉSEAU — un hook qui observe, une API qui agit (validée, limitée, avec reprise)
    * ======================================================================== */
 
+  let boosterPermit = null;
   const net = (() => {
     const nativeFetch = window.fetch.bind(window);
     const lastSeen = new Map(); // nom du handler → dernière URL vue (pour rejouer la requête du site)
     const mutationListeners = new Set();
+    const boosterRequestIds = new Map(); // expiration à 10 min, au-delà des retries de 2 min du site
     let headersFrom = null; // dernière requête same-origin lue : source des en-têtes
 
     const isRequest = (x) => typeof Request !== 'undefined' && x instanceof Request;
@@ -537,7 +539,29 @@
       window.fetch = function (input, init) {
         let copy = null;
         try { if (isRequest(input)) copy = input.clone(); } catch { /* corps déjà lu */ } // AVANT l’envoi : après, le corps est consommé
-        const promise = nativeFetch(input, init); // le site d’abord : on ne le ralentit ni ne le casse jamais
+        let promise;
+        const permit = boosterPermit;
+        const headers = new Headers(init?.headers ?? (isRequest(input) ? input.headers : undefined));
+        const requestId = headers.get('x-request-id');
+        for (const [id, expires] of boosterRequestIds) if (expires <= Date.now()) boosterRequestIds.delete(id);
+        if (requestId && boosterRequestIds.has(requestId)) {
+          promise = Promise.reject(new Error('Kyara+ : cette ouverture a déjà été envoyée'));
+        } else if (permit && methodOf(input, init) === 'POST' && BOOSTER_HINT.test(urlOf(input))) {
+          const sendFree = (body) => {
+            if (permit.used || permit.cancelled || !requestId || !sameOrigin(urlOf(input)) || !BoosterCore.freeRequestAllowed(pathOf(urlOf(input)), body, permit)) {
+              permit.blocked = 'Requête bloquée : coût nul, quantité ou type non confirmé';
+              window.dispatchEvent(new Event('kyara-plus:booster-state'));
+              throw new Error(permit.blocked);
+            }
+            permit.used = true;
+            boosterRequestIds.set(requestId, Date.now() + 600000);
+            return nativeFetch(input, init);
+          };
+          try {
+            promise = typeof init?.body === 'string' ? sendFree(init.body)
+              : copy && init?.body === undefined ? copy.clone().text().then(sendFree) : sendFree(undefined);
+          } catch (error) { promise = Promise.reject(error); }
+        } else promise = nativeFetch(input, init);
         try { watch(input, init, promise, copy); } catch (err) { log.info('hook ignoré', err); }
         return promise;
       };
@@ -2132,10 +2156,45 @@
   const BOOSTER_ALARM_CHANNEL = 'kyara-plus:booster-alarm';
   const boosterPath = BoosterCore.routeFor;
   const onBoosterPage = (type) => location.pathname.replace(/\/$/, '') === boosterPath(type);
+  const resetOpenButton = (button) => /^\s*Ouvrir\s+(?:un\s+autre|encore)\b/i.test(button?.textContent || '');
   const siteButtons = () => [...document.querySelectorAll('button')].filter((n) => !n.closest('#kp-panel') && n.getClientRects().length);
-  const freeCountInButton = (button) => BoosterCore.freeCountInButton(button?.textContent);
-  const freeOpenButton = () => siteButtons().find((button) => !button.disabled && /^\s*Ouvrir/i.test(button.textContent) && freeCountInButton(button) !== null) ?? null;
+  const siteOpenButton = () => siteButtons().find((button) => !button.disabled && /^\s*Ouvrir/i.test(button.textContent)) ?? null;
   const revealButton = () => siteButtons().find((button) => !button.disabled && /^tout révéler$/i.test(button.textContent.trim())) ?? null;
+
+  /** Réagit aux mutations même si requestAnimationFrame et les timers sont ralentis. */
+  function waitForBooster(fn, timeout) {
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const cleanup = () => {
+        observer.disconnect(); clearTimeout(timer);
+        for (const type of ['message', 'storage', 'popstate', 'kyara-plus:booster-state']) window.removeEventListener(type, check);
+      };
+      const check = () => {
+        if (finished) return;
+        let value;
+        try { value = fn(); } catch { return; }
+        if (value) { finished = true; cleanup(); resolve(value); }
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true });
+      const timer = setTimeout(() => { check(); if (!finished) { finished = true; cleanup(); reject(new Error('délai dépassé')); } }, document.hidden ? Math.max(timeout, 180000) : timeout);
+      for (const type of ['message', 'storage', 'popstate', 'kyara-plus:booster-state']) window.addEventListener(type, check);
+      check();
+    });
+  }
+
+  async function prepareBoosterAnimation(active) {
+    const options = siteButtons().find((button) => button.getAttribute('aria-label') === 'Options d’ouverture');
+    if (!options) throw new Error('Options d’ouverture introuvables : animations non confirmées');
+    // Les éléments titre/description du site se suivent sans espace dans textContent.
+    const animation = () => [...document.querySelectorAll('input[type="checkbox"]')].find((input) => /^Animations/i.test(input.closest('label')?.textContent.trim() || input.getAttribute('aria-label') || ''));
+    if (!animation()) options.click();
+    await waitForBooster(() => !active() || animation(), 5000);
+    if (!active()) return;
+    if (animation().checked) animation().click();
+    await waitForBooster(() => !active() || animation()?.checked === false, 5000);
+    if (options.getAttribute('aria-expanded') === 'true') options.click();
+  }
 
   function freeBoosterIndicator() {
     const nodes = [...document.querySelectorAll('a.pill[href="#boosters"]'), ...document.querySelectorAll('[aria-label]')];
@@ -2162,7 +2221,14 @@
     const match = /(\d{1,2}:\d{2}(?::\d{2})?)/.exec(source);
     const parts = match ? match[1].split(':').map(Number) : null;
     const seconds = parts ? parts.reduce((total, part) => total * 60 + part, 0) : null;
-    const value = { count: indicator.count, max: indicator.max, seconds, seenAt: Date.now() };
+    const seenAt = Date.now();
+    const previous = storage.get(KEY.boosterCount, null, isObj);
+    // Tant que le stock reste identique, un compteur figé ne repousse pas l'échéance.
+    const measuredRefill = seconds === null ? null : seenAt + seconds * 1000;
+    const previousRefill = previous?.count === indicator.count && Number.isFinite(previous.refillAt) ? previous.refillAt : null;
+    const refillAt = measuredRefill === null ? previousRefill
+      : previousRefill !== null ? Math.min(previousRefill, measuredRefill) : measuredRefill;
+    const value = { count: indicator.count, max: indicator.max, seconds, seenAt, refillAt };
     storage.set(KEY.boosterCount, value);
     return value;
   }
@@ -2183,9 +2249,10 @@
   function boosterHistory() {
     return storage.get(KEY.boosterHistory, [], Array.isArray).filter((e) => isObj(e) && Number.isFinite(e.at) && Array.isArray(e.cards));
   }
-  function rememberBoosterRewards(type, cards) {
+  const historyBoosterCount = (history) => history.reduce((total, entry) => total + (Number.isInteger(entry.quantity) && entry.quantity > 0 ? entry.quantity : 1), 0);
+  function rememberBoosterRewards(type, cards, quantity) {
     const history = boosterHistory();
-    history.push({ at: Date.now(), type, cards });
+    history.push({ at: Date.now(), type, cards, quantity });
     storage.set(KEY.boosterHistory, history.slice(-500));
     scheduleRender();
   }
@@ -2197,7 +2264,7 @@
     const history = boosterHistory();
     const cards = history.flatMap((e) => e.cards).map(knownReward);
     return [
-      `${history.length} booster(s) · ${cards.length} carte(s) reconnue(s)`,
+      `${historyBoosterCount(history)} booster(s) · ${cards.length} carte(s) reconnue(s)`,
       ...RARITIES.map((r) => `${r.name} : ${cards.filter((c) => c.rarity === r.code).length}`),
       `Wishlist : ${cards.filter((c) => c.wished).length} carte(s)`,
       ...history.slice(-5).reverse().flatMap((e) => e.cards.map(knownReward).map((c) => `${c.wished ? '♥ ' : ''}${c.name} · ${c.rarity || '?'} · ${BOOSTER_LABELS[e.type] || e.type}`)),
@@ -2222,9 +2289,11 @@
     },
     stop() {
       this.generation++;
+      if (boosterPermit) boosterPermit.cancelled = true;
       clearTimeout(this.timer);
       requestBoosterWake(null);
       this.setStatus('En pause · aucune nouvelle ouverture');
+      window.dispatchEvent(new Event('kyara-plus:booster-state'));
     },
     start() {
       this.failures = 0;
@@ -2240,18 +2309,16 @@
         this.setStatus('Automatisation pilotée depuis un autre onglet Kyara');
         clearTimeout(this.timer);
         this.timer = setTimeout(() => this.tick(), 30000);
-        requestBoosterWake(Date.now() + 30000);
+        requestBoosterWake(null); // seul l’onglet pilote garde une alarme et la protection du déchargement
         return;
       }
       if (owner?.id === TAB_ID) storage.set(KEY.boosterOwner, { id: TAB_ID, until: Date.now() + 120000 });
-      if (Date.now() < this.nextAt()) { this.schedule(this.nextAt()); return; }
+      const deadline = this.nextAt();
+      if (Date.now() < deadline) { this.schedule(deadline); return; }
       const count = readFreeBoosterCount();
-      if (count && !count.estimated && count.count === 0 && count.seconds > 0) {
-        this.setStatus('En attente du prochain booster gratuit');
-        this.schedule(BoosterCore.nextWakeAt(count, count.seenAt));
-        return;
-      }
-      if (count && !count.estimated && count.count === 0 && count.seconds === 0) {
+      const target = getSettings().booster.batchSize;
+      // L'échéance mémorisée reste valable même si le site ne met plus son DOM à jour.
+      if (count && !count.estimated && count.count < target && (count.seconds === 0 || (Number.isFinite(count.refillAt) && count.refillAt <= Date.now()))) {
         const lastRefresh = storage.get(KEY.boosterRefresh, 0, Number.isFinite);
         if (Date.now() - lastRefresh > 60000) {
           storage.set(KEY.boosterRefresh, Date.now());
@@ -2260,6 +2327,11 @@
           return;
         }
       }
+      if (count && !count.estimated && count.count < target) {
+        this.setStatus(`En attente du lot · ${count.count}/${target} gratuits · boucle active`);
+        this.schedule(BoosterCore.nextWakeAt(count, count.seenAt, target));
+        return;
+      }
       await this.run({ manual: false });
     },
     async run({ manual = false } = {}) {
@@ -2267,7 +2339,7 @@
       if (!navigator.locks) { this.setStatus('Verrou inter-onglets indisponible : ouverture suspendue'); return; }
       const generation = this.generation;
       const cfg = { ...getSettings().booster };
-      const active = () => generation === this.generation && cfg.type === getSettings().booster.type && (manual || (getSettings().booster.enabled && storage.get(KEY.boosterOwner, null, isObj)?.id === TAB_ID));
+      const active = () => generation === this.generation && cfg.type === getSettings().booster.type && cfg.batchSize === getSettings().booster.batchSize && (manual || (getSettings().booster.enabled && storage.get(KEY.boosterOwner, null, isObj)?.id === TAB_ID));
       this.setRunning(true);
       let result = { opened: 0, reason: '', uncertain: false }, acquired = false;
       try {
@@ -2282,53 +2354,60 @@
           if (!onBoosterPage(cfg.type)) {
             this.setStatus(`Navigation vers ${BOOSTER_LABELS[cfg.type]}…`);
             navigate(boosterPath(cfg.type));
-            await waitFor(() => !active() || onBoosterPage(cfg.type), 15000);
+            await waitForBooster(() => !active() || onBoosterPage(cfg.type), 15000);
           }
           if (!active()) return;
           // La wishlist et le catalogue enrichissent le bilan ; ils ne bloquent pas l’ouverture.
           ensure('catalog', load.catalog);
           ensure('wishlist', load.wishlist);
           const ready = async () => {
-            await waitFor(() => !active() || !onBoosterPage(cfg.type) || freeOpenButton() || revealButton(), 20000);
+            await waitForBooster(() => !active() || !onBoosterPage(cfg.type) || siteOpenButton() || revealButton(), 20000);
             if (!active() || !onBoosterPage(cfg.type)) return;
             const reveal = revealButton();
-            if (reveal) { reveal.click(); await waitFor(() => freeOpenButton() || !active(), 15000); }
+            if (reveal) { reveal.click(); await waitForBooster(() => siteOpenButton() || !active(), 15000); }
           };
           result = await BoosterCore.runBatch({
             active, onRoute: () => onBoosterPage(cfg.type), ready,
             reset: async () => {
               if (!active() || !onBoosterPage(cfg.type)) return;
-              freeOpenButton()?.click();
-              await waitFor(() => {
-                const button = freeOpenButton();
-                return !active() || (button && !/^\s*Ouvrir\s+un\s+autre\b/i.test(button.textContent));
+              const reset = siteOpenButton();
+              if (resetOpenButton(reset)) reset.click();
+              await waitForBooster(() => {
+                const button = siteOpenButton();
+                return !active() || (button && !resetOpenButton(button));
               }, 10000);
             },
-            stock: liveFreeBoosterCount, button: freeOpenButton,
-            single: async () => {
+            stock: liveFreeBoosterCount, button: siteOpenButton,
+            quantity: async (quantity) => {
               if (!active() || !onBoosterPage(cfg.type)) return;
-              const single = siteButtons().find((n) => /^×\s*1$/.test(n.textContent.trim()) && n.hasAttribute('aria-pressed'));
-              if (!single) throw new Error('Sélecteur ×1 introuvable');
-              if (single.getAttribute('aria-pressed') !== 'true') single.click();
-              await waitFor(() => siteButtons().some((n) => /^×\s*1$/.test(n.textContent.trim()) && n.getAttribute('aria-pressed') === 'true') || !active(), 3000);
+              await prepareBoosterAnimation(active);
+              if (!active()) return;
+              const selector = () => siteButtons().find((n) => n.textContent.trim() === `×${quantity}` && n.hasAttribute('aria-pressed'));
+              const choice = selector();
+              if (!choice || choice.disabled) throw new Error(`Sélecteur ×${quantity} indisponible`);
+              if (choice.getAttribute('aria-pressed') !== 'true') choice.click();
+              await waitForBooster(() => selector()?.getAttribute('aria-pressed') === 'true' || !active(), 3000);
             },
-            open: (button) => { const response = this.prepareOpenResponse(); button.click(); return response; },
-            confirm: (before) => waitFor(() => BoosterCore.consumptionConfirmed(before, liveFreeBoosterCount()), 20000),
+            open: (button, quantity) => { boosterPermit = { type: cfg.type, quantity }; const response = this.prepareOpenResponse(); button.click(); return response; },
+            confirm: async (before, quantity) => {
+              await waitForBooster(() => boosterPermit?.blocked || BoosterCore.consumptionConfirmed(before, liveFreeBoosterCount(), quantity), 120000);
+              if (boosterPermit?.blocked) throw new Error(boosterPermit.blocked);
+            },
             reveal: async () => {
-              await waitFor(() => revealButton() || freeOpenButton() || resultCardsFromPage().length, 20000);
+              await waitForBooster(() => revealButton() || siteOpenButton() || resultCardsFromPage().length, 20000);
               const reveal = revealButton();
               if (reveal) reveal.click();
-              await waitFor(() => resultCardsFromPage().length || freeOpenButton(), 15000);
+              await waitForBooster(() => resultCardsFromPage().length || siteOpenButton(), 15000);
             },
             rewards: async (response) => {
               const observed = await Promise.race([response, sleep(2500).then(() => null)]);
               const fromPage = resultCardsFromPage();
-              if (fromPage.length) return fromPage;
+              if (fromPage.length >= (observed?.ids?.length || 0)) return fromPage;
               return (observed?.ids || []).map((id) => ({ id, name: cardInfo(id).name, rarity: cardInfo(id).rarity?.code || null, wished: inWishlist(id), wishlistKnown: store.get('wishlistKnown') }));
             },
-            record: (cards) => rememberBoosterRewards(cfg.type, cards),
-            cleanup: () => this.cancelPendingOpen(), status: (text) => this.setStatus(`${BOOSTER_LABELS[cfg.type]} · ${text}`), sleep,
-          }, { max: cfg.max, spacingMs: cfg.spacingSec * 1000 });
+            record: (cards, quantity) => rememberBoosterRewards(cfg.type, cards, quantity),
+            cleanup: () => { this.cancelPendingOpen(); boosterPermit = null; }, status: (text) => this.setStatus(`${BOOSTER_LABELS[cfg.type]} · ${text}`), sleep,
+          }, { size: cfg.batchSize, spacingMs: cfg.spacingSec * 1000 });
         });
       } catch (error) { result.reason = error.message || 'Ouverture interrompue'; }
       finally { this.cancelPendingOpen(); this.setRunning(false); }
@@ -2340,8 +2419,11 @@
       this.failures = result.opened ? 0 : this.failures + 1;
       if (getSettings().booster.enabled) {
         const count = readFreeBoosterCount();
-        const wake = count && !count.estimated && count.count === 0 && count.seconds > 0
-          ? BoosterCore.nextWakeAt(count, now)
+        const current = getSettings().booster;
+        const changed = current.type !== cfg.type || current.batchSize !== cfg.batchSize;
+        const wake = changed ? now + 1000 : count && !count.estimated && count.count < current.batchSize
+          ? BoosterCore.nextWakeAt(count, now, current.batchSize)
+          : result.opened > 0 && count && !count.estimated && count.count >= current.batchSize ? now + current.spacingSec * 1000
           : now + (acquired ? Math.min(300000, 15000 * 2 ** Math.min(this.failures, 4)) : 30000);
         this.schedule(wake);
       }
@@ -2377,7 +2459,7 @@
     const previous = getSettings().booster;
     store.set('settings', normalizeSettings(storage.get(KEY.settings, {}, isObj)));
     const cfg = getSettings().booster;
-    if (!cfg.enabled || cfg.type !== previous.type) booster.stop();
+    if (!cfg.enabled || cfg.type !== previous.type || cfg.batchSize !== previous.batchSize) booster.stop();
     if (cfg.enabled) { storage.set(KEY.boosterNext, Date.now()); booster.tick(); }
   });
   window.addEventListener('online', () => booster.tick());
@@ -2453,7 +2535,7 @@
     dyn.booster = el('div', { class: 'kp-status', role: 'status', 'aria-live': 'polite' });
     dyn.auto = btn(cfg.enabled ? 'Mettre en pause' : 'Activer l’automatisation', () => setAutomatic(!getSettings().booster.enabled));
     dyn.auto.classList.add('kp-primary');
-    dyn.manual = btn('Ouvrir maintenant', () => { storage.set(KEY.boosterNext, Date.now()); booster.run({ manual: true }); });
+    dyn.manual = btn('Ouvrir le lot maintenant', () => { storage.set(KEY.boosterNext, Date.now()); booster.run({ manual: true }); });
     dyn.badge = el('span', { class: 'kp-chip', text: cfg.enabled ? 'ACTIF' : 'EN PAUSE', 'data-active': String(cfg.enabled) });
     const packButtons = BOOSTER_TYPES.map((type, index) => el('button', {
       type: 'button', class: 'kp-pack', 'aria-pressed': String(type === cfg.type), 'aria-label': `Sélectionner ${BOOSTER_LABELS[type]}`,
@@ -2465,16 +2547,17 @@
       },
     }, el('b', { text: icons[index], 'aria-hidden': 'true' }), BOOSTER_LABELS[type]));
     return [
-      panelHeading('Automatisation · 自動', 'Tes boosters, au fil du temps.', 'Choisis ton univers. Kyara+ ouvre les gratuits disponibles et suit le prochain rechargement.'),
+      panelHeading('Automatisation · 自動', 'Ton lot, en boucle.', 'Choisis le type et la taille du lot. Kyara+ attend le stock complet, ouvre gratuitement, puis attend le lot suivant.'),
       dyn.stock,
       el('section', { class: 'kp-card' },
         el('div', { class: 'kp-card-head' }, el('h4', { text: 'Ouverture automatique' }), dyn.badge),
         el('div', { class: 'kp-btns' }, dyn.auto, dyn.manual), dyn.booster,
         el('p', { class: 'kp-select-label', text: 'TYPE DE BOOSTER' }),
         el('div', { class: 'kp-pack-grid', role: 'group', 'aria-label': 'Type de booster' }, packButtons),
-        field('Boosters max par passage', cfg.max, 1, 10, (v) => updateSettings((d) => { d.booster.max = v; })),
-        field('Pause entre deux ouvertures (s)', cfg.spacingSec, 1, 30, (v) => updateSettings((d) => { d.booster.spacingSec = v; })),
-        el('p', { class: 'kp-note', text: 'Gratuits uniquement · ×1 par ouverture · garde cet onglet Kyara et le navigateur ouverts. Sur mobile, reste au premier plan : Android ou le mode veille peuvent suspendre les ouvertures.' })),
+        field('Boosters par lot · seuil à attendre', cfg.batchSize, 1, 10, (v) => { booster.stop(); updateSettings((d) => { d.booster.batchSize = v; }); if (getSettings().booster.enabled) { storage.set(KEY.boosterNext, Date.now()); booster.tick(); } }),
+        field('Pause entre actions d’ouverture (s)', cfg.spacingSec, 1, 30, (v) => updateSettings((d) => { d.booster.spacingSec = v; })),
+        el('p', { class: 'kp-note', text: 'Exemple : 10 → attendre 10 gratuits, ouvrir ×10, recommencer. 5 → ×5. Les autres lots utilisent ×5 puis ×1. La pause espace les clics successifs si du stock reste disponible ; elle ne sépare pas les boosters d’un clic ×5 ou ×10.' }),
+        el('p', { class: 'kp-note', text: 'Zéro dépense : boutons mixtes/payants bloqués et plafond réseau maxChakra = 0 obligatoire. Animations du site désactivées pour fonctionner dans un onglet en arrière-plan. Garde le navigateur ouvert ; veille du PC et suspension Android interrompent les ouvertures.' })),
       panelCard('Ton dernier tirage', dyn.latest = el('div')),
     ];
   }
@@ -2488,7 +2571,7 @@
     for (const entry of entries) {
       const cards = entry.cards.map(knownReward);
       target.appendChild(el('article', { class: 'kp-history-entry' },
-        el('div', { class: 'kp-history-head' }, el('b', { text: BOOSTER_LABELS[entry.type] || entry.type }),
+        el('div', { class: 'kp-history-head' }, el('b', { text: `${BOOSTER_LABELS[entry.type] || entry.type} · ×${entry.quantity || 1}` }),
           el('time', { text: new Date(entry.at).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }), datetime: new Date(entry.at).toISOString() })),
         cards.length ? el('div', { class: 'kp-loot' }, cards.map((card) => el('a', {
           class: 'kp-loot-card', href: `/wiki/${card.id}`, target: '_blank', rel: 'noopener', title: card.name, '--kp-rc': rarityColor(rarityOf(card.rarity)),
@@ -2520,7 +2603,7 @@
       if (dyn.stock.dataset.sig !== sig) {
         dyn.stock.dataset.sig = sig;
         dyn.stock.replaceChildren(metric('Boosters disponibles', count ? `${count.estimated ? '~' : ''}${count.count}/${count.max}` : '—', true),
-          metric('Prochain gratuit', count?.seconds != null ? countdown(count.seconds) : '—'), metric('Boosters ouverts', String(history.length)));
+          metric('Prochain gratuit', count?.seconds != null ? countdown(count.seconds) : '—'), metric('Boosters ouverts', String(historyBoosterCount(history))));
       }
     }
     if (dyn.booster?.isConnected) setText(dyn.booster, boosterStatusText());
@@ -2531,7 +2614,7 @@
     if (dyn.latest?.isConnected && dyn.latest.dataset.sig !== sig) { dyn.latest.dataset.sig = sig; renderHistory(dyn.latest, history.slice(-1)); }
     if (dyn.history?.isConnected && dyn.history.dataset.sig !== sig) {
       dyn.history.dataset.sig = sig;
-      dyn.historyMetrics.replaceChildren(metric('Boosters ouverts', String(history.length), true), metric('Cartes reconnues', String(cards.length)), metric('Cartes de wishlist', String(cards.filter((c) => c.wished).length)));
+      dyn.historyMetrics.replaceChildren(metric('Boosters ouverts', String(historyBoosterCount(history)), true), metric('Cartes reconnues', String(cards.length)), metric('Cartes de wishlist', String(cards.filter((c) => c.wished).length)));
       dyn.rarities.replaceChildren(...RARITIES.map((rarity) => el('div', { class: 'kp-rarity-stat', '--kp-rc': rarityColor(rarity) }, el('b', { text: String(cards.filter((c) => c.rarity === rarity.code).length) }), el('small', { text: rarity.name }))));
       renderHistory(dyn.history, history.slice(-5).reverse());
       setText(dyn.wishlistNote, store.get('wishlistKnown') ? '♥ Les correspondances wishlist sont mémorisées au moment du tirage.' : 'Wishlist non chargée : ouvre ta liste d’envies sur Kyara pour permettre les correspondances.');

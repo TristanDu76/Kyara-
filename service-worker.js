@@ -13,8 +13,12 @@ function enqueue(tabId, task) {
 }
 async function cancel(tabId) {
   const name = PREFIX + tabId;
+  const stored = await extension.storage.session.get(name);
   await extension.alarms.clear(name);
   await extension.storage.session.remove(name);
+  if (stored[name]?.originalAutoDiscardable === true) {
+    try { await extension.tabs.update(tabId, { autoDiscardable: true }); } catch { /* onglet déjà fermé */ }
+  }
 }
 
 extension.runtime.onMessage.addListener((message, sender) => {
@@ -29,7 +33,15 @@ extension.runtime.onMessage.addListener((message, sender) => {
   return enqueue(tabId, async () => {
     const when = Math.max(Date.now() + 500, message.when);
     const name = PREFIX + tabId;
-    await extension.storage.session.set({ [name]: { tabId, when } });
+    const previous = await extension.storage.session.get(name);
+    let originalAutoDiscardable = previous[name]?.originalAutoDiscardable;
+    if (typeof browser === 'undefined') {
+      try {
+        if (originalAutoDiscardable === undefined) originalAutoDiscardable = (await extension.tabs.get(tabId)).autoDiscardable;
+        if (originalAutoDiscardable === true) await extension.tabs.update(tabId, { autoDiscardable: false });
+      } catch { /* la protection est facultative ; l’alarme reste active */ }
+    }
+    await extension.storage.session.set({ [name]: { tabId, when, originalAutoDiscardable } });
     await extension.alarms.create(name, { when });
     return { ok: true };
   });
@@ -45,7 +57,11 @@ extension.alarms.onAlarm.addListener((alarm) => {
     try {
       await extension.tabs.sendMessage(target.tabId, { channel: CHANNEL, type: 'wake' });
     } catch {
-      await cancel(target.tabId);
+      const tab = await extension.tabs.get(target.tabId).catch(() => null);
+      if (tab?.discarded) {
+        await extension.tabs.reload(target.tabId);
+        await extension.alarms.create(alarm.name, { when: Date.now() + 5000 });
+      } else await cancel(target.tabId);
     }
   });
 });

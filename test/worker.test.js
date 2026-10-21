@@ -6,7 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 function fixture(namespace = 'chrome') {
-  const listeners = {}, storage = {}, alarms = new Map(), sent = [];
+  const listeners = {}, storage = {}, alarms = new Map(), sent = [], tabProperties = new Map(), updates = [], reloads = [];
   let now = 1000;
   const chrome = {
     runtime: { onMessage: { addListener(fn) { listeners.message = fn; } } },
@@ -20,13 +20,19 @@ function fixture(namespace = 'chrome') {
       async get(key) { return { [key]: storage[key] }; },
       async remove(key) { delete storage[key]; },
     } },
-    tabs: { async sendMessage(id, message) { sent.push({ id, message }); }, onRemoved: { addListener(fn) { listeners.removed = fn; } } },
+    tabs: {
+      async sendMessage(id, message) { sent.push({ id, message }); },
+      async get(id) { return { id, autoDiscardable: true, discarded: false, ...tabProperties.get(id) }; },
+      async update(id, properties) { tabProperties.set(id, { ...tabProperties.get(id), ...properties }); updates.push({ id, properties }); },
+      async reload(id) { reloads.push(id); tabProperties.set(id, { ...tabProperties.get(id), discarded: false }); },
+      onRemoved: { addListener(fn) { listeners.removed = fn; } },
+    },
   };
   const context = { [namespace]: chrome, Date: { now: () => now }, URL };
   if (namespace === 'browser') context.chrome = new Proxy({}, { get() { throw new Error('API chrome utilisée sur Firefox'); } });
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'service-worker.js'), 'utf8'), context);
   const message = (id, type, when, url = 'https://kyara.games/ouvrir/shonen') => listeners.message({ channel: 'kyara-plus:booster-alarm', type, when }, { tab: { id }, url });
-  return { chrome, listeners, storage, alarms, sent, message, setNow: (value) => { now = value; } };
+  return { chrome, listeners, storage, alarms, sent, message, tabProperties, updates, reloads, setNow: (value) => { now = value; } };
 }
 test('deux onglets gardent leurs propres réveils et annulations', async () => {
   const f = fixture();
@@ -79,4 +85,27 @@ test('l’échec d’un ancien réveil ne supprime pas la nouvelle programmation
   rejectSend(new Error('Ancien document fermé'));
   await Promise.all([wake, next]);
   assert.equal(f.alarms.get(name), 5000);
+});
+
+test('Chrome protège seulement l’onglet pilote du déchargement et restaure sa valeur initiale', async () => {
+  const f = fixture();
+  await f.message(7, 'schedule', 5000); await f.message(7, 'schedule', 6000);
+  assert.equal(f.tabProperties.get(7).autoDiscardable, false);
+  await f.message(7, 'cancel'); assert.equal(f.tabProperties.get(7).autoDiscardable, true);
+  f.tabProperties.set(42, { autoDiscardable: false });
+  await f.message(42, 'schedule', 5000); await f.message(42, 'cancel');
+  assert.equal(f.tabProperties.get(42).autoDiscardable, false);
+});
+test('Firefox ne reçoit pas l’option Chromium autoDiscardable', async () => {
+  const f = fixture('browser'); await f.message(7, 'schedule', 5000); await f.message(7, 'cancel');
+  assert.equal(f.updates.length, 0);
+});
+test('un onglet déchargé est rechargé en arrière-plan puis réveillé sans l’activer', async () => {
+  const f = fixture(); await f.message(7, 'schedule', 1500); f.setNow(1500);
+  f.tabProperties.set(7, { discarded: true, autoDiscardable: false });
+  f.chrome.tabs.sendMessage = async () => { throw new Error('Onglet déchargé'); };
+  await f.listeners.alarm({ name: 'kyara-plus:booster-wake:7' });
+  assert.deepEqual(f.reloads, [7]); assert.equal(f.alarms.get('kyara-plus:booster-wake:7'), 6500);
+  assert.ok(f.storage['kyara-plus:booster-wake:7']);
+  assert.ok(f.updates.every((update) => !Object.hasOwn(update.properties, 'active')));
 });
